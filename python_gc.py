@@ -1,98 +1,171 @@
 import logging
-import struct from volatility3.framework 
-import interfaces, renderers 
-from volatility3.plugins.linux 
-import pslist from volatility3.framework.objects 
-import utility from volatility3.framework 
-import exceptions, constants  
-vollog = logging.getLogger(__name__) 
-logging.getLogger('volatility3.framework.symbols.linux.extensions').setLevel(logging.ERROR)   
+from volatility3.framework import interfaces, renderers
+from volatility3.plugins.linux import pslist
+from volatility3.framework.objects import utility
+from volatility3.framework import exceptions
 
-class PythonGCGenerationWalker(pslist.PsList):     
-    _required_framework_version = (2, 0, 0)      
-    
-    def _get_proc_layer(self, task):         
-        try:             
-            return self.context.layers[task.add_process_layer()]         
-        except exceptions.LayerException:             
-            return None      
-    
-    def _find_interpreter_state(self, task, proc_layer):         
-        for vma in task.mm.get_mmap_iter():             
-            if not vma.is_readable():                 
-                continue             
-            try:                 
-                data = proc_layer.read(vma.vm_start, min(4096, vma.vm_end - vma.vm_start))                 
-                offset = data.find(b"PyInterpreterState")                 
-                if offset != -1:                     
-                    return vma.vm_start + offset             
-            except exceptions.PagedInvalidAddressException:                 
-                continue         
-        return None      
-    def _walk_generation(self, proc_layer, generation_head):         
-        try:                         
-            head_ptr = int.from_bytes(proc_layer.read(generation_head, 8), 'little')             
-            if not head_ptr:                 
-                return              
-            current = head_ptr             
-            seen = set()              
-            while current and current not in seen:                 
-                seen.add(current)                 
-                yield current                 
-                next_ptr = proc_layer.read(current + 8, 8)                 
-                current = int.from_bytes(next_ptr, 'little')          
-        except exceptions.PagedInvalidAddressException:             
-            pass      
+vollog = logging.getLogger(__name__)
+logging.getLogger('volatility3.framework.symbols.linux.extensions').setLevel(logging.ERROR)
+
+class LinuxPythonGCTraversal(pslist.PsList):
+    """Traverses Python's Garbage Collector to find Python objects in memory for Linux processes."""
+
+    _required_framework_version = (2, 0, 0)
+
+    def _extract_string(self, proc_layer, object_pointer):
+        """Extract a C string from memory."""
+        string_bytes = []
+        offset = 0
         
-    def _get_object_type(self, proc_layer, obj_addr):         
-        try:             
-            ob_type = int.from_bytes(proc_layer.read(obj_addr, 8), 'little')             
-            tp_name_addr = int.from_bytes(proc_layer.read(ob_type + 0x38, 8), 'little')             
-            data = proc_layer.read(tp_name_addr, 256)             
-            return data.split(b'\x00')[0].decode('utf-8', errors='replace')         
-        except Exception:             
-            return "<unknown>"      
+        while True:
+            try:
+                char = proc_layer.read(object_pointer + offset, 1)[0]
+                if char == 0:
+                    break
+                string_bytes.append(char)
+                offset += 1
+                if offset > 1000:  # Safety limit
+                    break
+            except exceptions.InvalidAddressException:
+                break
+        
+        return bytes(string_bytes).decode('utf-8', errors='replace')
     
-    def _generator(self, tasks):         
-        for task in tasks:             
-            task_name = utility.array_to_string(task.comm)             
-            if "python" not in task_name.lower():                 
-                continue             
-            proc_layer = self._get_proc_layer(task)             
-            if not proc_layer:                 
-                continue           
-
-            interpreter_state = self._find_interpreter_state(task, proc_layer)             
-            if not interpreter_state:                 
-                continue              
+    def _traverse_gc_list(self, proc_layer, list_head_addr):
+        """Traverse a linked list of PyGC_Head structures."""
+        objects = []
+        if not list_head_addr or list_head_addr == 0:
+            return objects
+        
+        seen_addresses = set()
+        current_addr = list_head_addr
+        
+        # Size definitions
+        pygc_head_size = 16  # PyGC_Head is 16 bytes
+        
+        while True:
+            if current_addr in seen_addresses or current_addr == 0:
+                break  # Prevent infinite loops
             
-            gc_state = interpreter_state + 616             
-            generations = interpreter_state + 640              
-            for gen_idx in range(3):                 
-                gen_head = generations + (gen_idx * 24)                                  
+            seen_addresses.add(current_addr)
+            
+            try:
+                # Read PyGC_Head.gc_next (first 8 bytes)
+                next_addr_bytes = proc_layer.read(current_addr, 8)
+                next_addr = int.from_bytes(next_addr_bytes, byteorder='little')
                 
-                try:                     
-                    head_bytes = proc_layer.read(gen_head, 8)                 
-                except exceptions.PagedInvalidAddressException:                     
-                    continue                  
+                # PyObject follows PyGC_Head
+                pyobj_addr = current_addr + pygc_head_size
                 
-                for obj_addr in self._walk_generation(proc_layer, gen_head):                     
-                    type_name = self._get_object_type(proc_layer, obj_addr)                     
-                    yield (0, (                         
-                        task.pid,                         
-                        task_name,                         
-                        f"Gen {gen_idx}",                         
-                        hex(obj_addr),                         
-                        type_name                     
-                        ))      
-    def run(self):         
-        return renderers.TreeGrid(             
-            [                 
-                ("PID", int),                 
-                ("Process", str),                 
-                ("Generation", str),                 
-                ("Object Address", str),                 
-                ("Type Name", str)             
-                ],             
-            self._generator(self.list_tasks(self.context, self.config["kernel"]))         
+                # Read PyObject.ob_refcnt (first 8 bytes)
+                refcnt_bytes = proc_layer.read(pyobj_addr, 8)
+                refcnt = int.from_bytes(refcnt_bytes, byteorder='little')
+                
+                # Read PyObject.ob_type (next 8 bytes)
+                ob_type_addr_bytes = proc_layer.read(pyobj_addr + 8, 8)
+                ob_type_addr = int.from_bytes(ob_type_addr_bytes, byteorder='little')
+                
+                # Read type name from tp_name (offset 24 in PyTypeObject)
+                if ob_type_addr and ob_type_addr != 0:
+                    tp_name_addr_bytes = proc_layer.read(ob_type_addr + 24, 8)
+                    tp_name_addr = int.from_bytes(tp_name_addr_bytes, byteorder='little')
+                    
+                    if tp_name_addr and tp_name_addr != 0:
+                        type_name = self._extract_string(proc_layer, tp_name_addr)
+                    else:
+                        type_name = "Unknown (Invalid tp_name)"
+                else:
+                    type_name = "Unknown (Invalid type pointer)"
+                
+                objects.append((pyobj_addr, refcnt, type_name))
+                
+                # Move to next item
+                if next_addr == 0 or next_addr == list_head_addr:
+                    break
+                    
+                current_addr = next_addr
+                
+            except exceptions.InvalidAddressException as e:
+                vollog.debug(f"Invalid address encountered: {e}")
+                break
+            
+        return objects
+
+    def _scan_for_interpreter_state(self, proc_layer, task):
+        """Scan process memory to find potential PyInterpreterState structures."""
+        potential_interp_states = []
+        
+        for vma in task.mm.get_mmap_iter():
+            if not vma.is_readable():
+                continue
+                
+            start = vma.vm_start
+            end = vma.vm_end
+            size = end - start
+            
+            # Skip very large regions to avoid excessive scanning
+            if size > 100 * 1024 * 1024:  # 100MB
+                continue
+                
+            try:
+                # Scan in chunks to handle large memory regions
+                chunk_size = 0x100000  # 1MB chunks
+                
+                for offset in range(0, size, chunk_size):
+                    curr_start = start + offset
+                    curr_size = min(chunk_size, size - offset)
+                    
+                    try:
+                        # Look for potential gc.generation0 pointers
+                        for i in range(0, curr_size - 720, 8):  # 720 = offset to generation0 + 8
+                            potential_interp_offset = curr_start + i
+                            
+                            # The gc struct is at offset 616 in PyInterpreterState
+                            gc_offset = potential_interp_offset + 616
+                            
+                            # generation0 is at offset 712 in PyInterpreterState (96 bytes into gc struct)
+                            gen0_ptr_addr = gc_offset + 96
+                            
+                            try:
+                                gen0_ptr_bytes = proc_layer.read(gen0_ptr_addr, 8)
+                                gen0_ptr = int.from_bytes(gen0_ptr_bytes, byteorder='little')
+                                
+                                # Check if this looks like a valid pointer
+                                if gen0_ptr and gen0_ptr != 0:
+                                    try:
+                                        # Check if the PyGC_Head struct looks valid
+                                        # Read the gc_next and gc_prev pointers
+                                        gc_next_bytes = proc_layer.read(gen0_ptr, 8)
+                                        gc_next = int.from_bytes(gc_next_bytes, byteorder='little')
+                                        
+                                        gc_prev_bytes = proc_layer.read(gen0_ptr + 8, 8)
+                                        gc_prev = int.from_bytes(gc_prev_bytes, byteorder='little')
+                                        
+                                        # If both next and prev pointers seem valid, we might have found a PyInterpreterState
+                                        if gc_next and gc_next != 0 and gc_prev and gc_prev != 0:
+                                            potential_interp_states.append(potential_interp_offset)
+                                    except exceptions.InvalidAddressException:
+                                        pass
+                            except exceptions.InvalidAddressException:
+                                pass
+                    except exceptions.InvalidAddressException:
+                        continue
+            except exceptions.InvalidAddressException:
+                continue
+                
+        return potential_interp_states
+
+    
+
+    def run(self):
+        return renderers.TreeGrid(
+            [
+                ("PID", int),
+                ("Process", str),
+                ("Object Address", renderers.format_hints.Hex),
+                ("Reference Count", int),
+                ("Type", str),
+                ("Generation", int)
+            ],
+            self._generator(self.list_tasks(self.context, self.config["kernel"]))
         )
