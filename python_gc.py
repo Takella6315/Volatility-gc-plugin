@@ -8,12 +8,10 @@ vollog = logging.getLogger(__name__)
 logging.getLogger('volatility3.framework.symbols.linux.extensions').setLevel(logging.ERROR)
 
 class LinuxPythonGCTraversal(pslist.PsList):
-    """Traverses Python's Garbage Collector to find Python objects in memory for Linux processes."""
 
     _required_framework_version = (2, 0, 0)
 
     def _extract_string(self, proc_layer, object_pointer):
-        """Extract a C string from memory."""
         string_bytes = []
         offset = 0
         
@@ -32,7 +30,6 @@ class LinuxPythonGCTraversal(pslist.PsList):
         return bytes(string_bytes).decode('utf-8', errors='replace')
     
     def _traverse_gc_list(self, proc_layer, list_head_addr):
-        """Traverse a linked list of PyGC_Head structures."""
         objects = []
         if not list_head_addr or list_head_addr == 0:
             return objects
@@ -40,7 +37,6 @@ class LinuxPythonGCTraversal(pslist.PsList):
         seen_addresses = set()
         current_addr = list_head_addr
         
-        # Size definitions
         pygc_head_size = 16  # PyGC_Head is 16 bytes
         
         while True:
@@ -50,7 +46,6 @@ class LinuxPythonGCTraversal(pslist.PsList):
             seen_addresses.add(current_addr)
             
             try:
-                # Read PyGC_Head.gc_next (first 8 bytes)
                 next_addr_bytes = proc_layer.read(current_addr, 8)
                 next_addr = int.from_bytes(next_addr_bytes, byteorder='little')
                 
@@ -92,7 +87,6 @@ class LinuxPythonGCTraversal(pslist.PsList):
         return objects
 
     def _scan_for_interpreter_state(self, proc_layer, task):
-        """Scan process memory to find potential PyInterpreterState structures."""
         potential_interp_states = []
         
         for vma in task.mm.get_mmap_iter():
@@ -103,12 +97,10 @@ class LinuxPythonGCTraversal(pslist.PsList):
             end = vma.vm_end
             size = end - start
             
-            # Skip very large regions to avoid excessive scanning
             if size > 100 * 1024 * 1024:  # 100MB
                 continue
                 
             try:
-                # Scan in chunks to handle large memory regions
                 chunk_size = 0x100000  # 1MB chunks
                 
                 for offset in range(0, size, chunk_size):
@@ -116,8 +108,7 @@ class LinuxPythonGCTraversal(pslist.PsList):
                     curr_size = min(chunk_size, size - offset)
                     
                     try:
-                        # Look for potential gc.generation0 pointers
-                        for i in range(0, curr_size - 720, 8):  # 720 = offset to generation0 + 8
+                        for i in range(0, curr_size - 720, 8):  
                             potential_interp_offset = curr_start + i
                             
                             # The gc struct is at offset 616 in PyInterpreterState
@@ -130,18 +121,14 @@ class LinuxPythonGCTraversal(pslist.PsList):
                                 gen0_ptr_bytes = proc_layer.read(gen0_ptr_addr, 8)
                                 gen0_ptr = int.from_bytes(gen0_ptr_bytes, byteorder='little')
                                 
-                                # Check if this looks like a valid pointer
                                 if gen0_ptr and gen0_ptr != 0:
                                     try:
-                                        # Check if the PyGC_Head struct looks valid
-                                        # Read the gc_next and gc_prev pointers
                                         gc_next_bytes = proc_layer.read(gen0_ptr, 8)
                                         gc_next = int.from_bytes(gc_next_bytes, byteorder='little')
                                         
                                         gc_prev_bytes = proc_layer.read(gen0_ptr + 8, 8)
                                         gc_prev = int.from_bytes(gc_prev_bytes, byteorder='little')
                                         
-                                        # If both next and prev pointers seem valid, we might have found a PyInterpreterState
                                         if gc_next and gc_next != 0 and gc_prev and gc_prev != 0:
                                             potential_interp_states.append(potential_interp_offset)
                                     except exceptions.InvalidAddressException:
